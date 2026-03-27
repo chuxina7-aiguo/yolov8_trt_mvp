@@ -333,6 +333,17 @@ void YoloV8TRT::postprocess(
             }
         }
 
+        // 调试：在前几帧の前几个 box 中输出类别分数的原始值
+        static int debug_count = 0;
+        if (i < 3 && debug_count < 2) {
+            std::printf("[debug frame#%d] box_id=%d: ", debug_count, i);
+            for (int c = 4; c < output_num_attrs_; ++c) {
+                std::printf("class[%d]=%.8f ", c - 4, read_value(c, i));
+            }
+            std::printf("-> best_cls=%d best_score=%.8f\n", best_cls, best_score);
+            if (i == 2) debug_count++;
+        }
+
         float raw_x1 = (cx - 0.5f * w - info.pad_x) / info.scale;
         float raw_y1 = (cy - 0.5f * h - info.pad_y) / info.scale;
         float raw_x2 = (cx + 0.5f * w - info.pad_x) / info.scale;
@@ -409,8 +420,8 @@ void YoloV8TRT::postprocess(
     }
 
     if (global_best_idx >= 0) {
-        std::printf("[postprocess best] layout=%s idx=%d cls=%d score=%.6f raw_input_px(cx,cy,w,h)=(%.3f,%.3f,%.3f,%.3f) mapped(x1,y1,x2,y2)=(%.3f,%.3f,%.3f,%.3f) scale=%.6f pad=(%.3f,%.3f)\n",
-                    is_box_major ? "box-major[8400,84]" : "attr-major[84,8400]",
+        std::printf("[postprocess best] layout=%s idx=%d cls=%d score=%.6f raw_input_px(cx,cy,w,h)=(%.3f,%.3f,%.3f,%.3f) mapped(x1,y1,x2,y2)=(%.3f,%.3f,%.3f,%.3f) scale=%.6f pad=(%.3f,%.3f) attrs=%d boxes=%d\n",
+                    is_box_major ? "box-major" : "attr-major",
                     global_best_idx,
                     global_best_cls,
                     global_best_score,
@@ -424,7 +435,9 @@ void YoloV8TRT::postprocess(
                     global_best_y2,
                     info.scale,
                     info.pad_x,
-                    info.pad_y);
+                    info.pad_y,
+                    output_num_attrs_,
+                    output_num_boxes_);
     }
 
     detections = nms(candidates, nms_thres_);
