@@ -8,8 +8,11 @@
 #include <mutex>
 #include <condition_variable>
 #include <vector>
+#include <queue>
 #include <atomic>
 #include <algorithm>
+#include <fstream>
+#include <direct.h>
 
 #include "httplib.h"
 #include "json.hpp"
@@ -32,10 +35,9 @@ FrameData g_latest_frame;               // 最新帧数据
 std::mutex g_frame_mtx;                 // 帧数据互斥锁
 std::condition_variable g_frame_cv;     // 帧数据条件变量
 
-cv::Mat global_frame;
-std::mutex cam_mtx;
-std::condition_variable cam_cv;
-bool fresh_frame = false;
+std::queue<cv::Mat> frame_queue;
+std::mutex frame_mutex;
+std::condition_variable frame_cv;
 
 std::atomic<bool> g_inference_running(true);   // 推理线程运行标志
 std::atomic<int> g_total_frames(0);            // 总帧计数
@@ -72,6 +74,49 @@ std::string base64_encode(const std::vector<uchar>& data) {
     return result;
 }
 
+std::string base64_decode(const std::string& in) {
+    static constexpr unsigned char kDecTable[256] = {
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,62,64,64,64,63,
+        52,53,54,55,56,57,58,59,60,61,64,64,64,64,64,64,
+        64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,64,64,64,64,64,
+        64,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64
+    };
+
+    std::string out;
+    out.reserve(in.size() * 3 / 4);
+
+    int val = 0;
+    int valb = -8;
+    for (unsigned char c : in) {
+        if (c == '=') {
+            break;
+        }
+        const unsigned char d = kDecTable[c];
+        if (d == 64) {
+            continue;
+        }
+        val = (val << 6) + d;
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<char>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
+
 // ============================================================================
 // 【拉流线程函数】Camera Producer Thread
 // ============================================================================
@@ -95,7 +140,7 @@ void camera_thread_func(const std::string& url) {
     if (!cap.isOpened()) {
         std::cerr << "[CameraThread ERROR] 无法打开视频源: " << url << std::endl;
         g_inference_running = false;
-        cam_cv.notify_all();
+        frame_cv.notify_all();
         return;
     }
 
@@ -111,11 +156,10 @@ void camera_thread_func(const std::string& url) {
         }
 
         {
-            std::lock_guard<std::mutex> lock(cam_mtx);
-            global_frame = tmp.clone();
-            fresh_frame = true;
+            std::lock_guard<std::mutex> lock(frame_mutex);
+            frame_queue.push(tmp.clone());
         }
-        cam_cv.notify_one();
+        frame_cv.notify_one();
     }
 
     cap.release();
@@ -138,7 +182,7 @@ void inference_worker_thread(const std::string& input_source, const std::string&
     if (!detector.isReady()) {
         std::cerr << "[InferenceThread ERROR] 检测器初始化失败！" << std::endl;
         g_inference_running = false;
-        cam_cv.notify_all();
+        frame_cv.notify_all();
         return;
     }
 
@@ -154,22 +198,27 @@ void inference_worker_thread(const std::string& input_source, const std::string&
     int fps_count = 0;
 
     while (g_inference_running) {
+        auto start_time = std::chrono::steady_clock::now();
+
         {
-            std::unique_lock<std::mutex> lock(cam_mtx);
-            cam_cv.wait(lock, [] { return fresh_frame || !g_inference_running; });
+            std::unique_lock<std::mutex> lock(frame_mutex);
+            frame_cv.wait(lock, [] { return !frame_queue.empty() || !g_inference_running; });
             if (!g_inference_running) {
                 break;
             }
-            frame = global_frame.clone();
-            fresh_frame = false;
+            // 直接取最新帧并清空旧帧，彻底避免积压
+            frame = std::move(frame_queue.back());
+            std::queue<cv::Mat> empty;
+            std::swap(frame_queue, empty);
         }
 
         if (frame.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
             continue;
         }
 
-        // 记录时间戳
-        auto start_time = std::chrono::high_resolution_clock::now();
+        // 记录推理耗时
+        auto infer_start_time = std::chrono::high_resolution_clock::now();
 
         // ====================================================================
         // 推理
@@ -178,6 +227,7 @@ void inference_worker_thread(const std::string& input_source, const std::string&
         if (!detector.infer(frame, dets)) {
             std::cerr << "[InferenceThread] 第 " << frame_id << " 帧推理失败，已跳过。" << std::endl;
             ++frame_id;
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
             continue;
         }
 
@@ -189,8 +239,8 @@ void inference_worker_thread(const std::string& input_source, const std::string&
         // ====================================================================
         // 计算 FPS
         // ====================================================================
-        auto end_time = std::chrono::high_resolution_clock::now();
-        double elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+        auto infer_end_time = std::chrono::high_resolution_clock::now();
+        double elapsed_ms = std::chrono::duration<double, std::milli>(infer_end_time - infer_start_time).count();
         double real_fps = elapsed_ms > 0 ? 1000.0 / elapsed_ms : 0.0;
         avg_fps += real_fps;
         fps_count++;
@@ -212,13 +262,25 @@ void inference_worker_thread(const std::string& input_source, const std::string&
         // ====================================================================
         cv::resize(frame, resized_frame, cv::Size(640, 480));
 
+        // 高分辨率保护：编码前限制到不超过 1280x720（保持比例）
+        if (resized_frame.cols > 1280 || resized_frame.rows > 720) {
+            const double sx = 1280.0 / static_cast<double>(resized_frame.cols);
+            const double sy = 720.0 / static_cast<double>(resized_frame.rows);
+            const double scale = std::min(1.0, std::min(sx, sy));
+            const int new_w = std::max(1, static_cast<int>(resized_frame.cols * scale));
+            const int new_h = std::max(1, static_cast<int>(resized_frame.rows * scale));
+            cv::resize(resized_frame, resized_frame, cv::Size(new_w, new_h));
+        }
+
         // ====================================================================
         // 将图像压缩为 JPG
         // ====================================================================
         std::vector<uchar> jpg_buffer;
-        if (!cv::imencode(".jpg", resized_frame, jpg_buffer, {cv::IMWRITE_JPEG_QUALITY, 80})) {
+        std::vector<int> encode_params = {cv::IMWRITE_JPEG_QUALITY, 50};
+        if (!cv::imencode(".jpg", resized_frame, jpg_buffer, encode_params)) {
             std::cerr << "[InferenceThread] JPG 编码失败！" << std::endl;
             ++frame_id;
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
             continue;
         }
 
@@ -232,9 +294,9 @@ void inference_worker_thread(const std::string& input_source, const std::string&
         // ====================================================================
         json detections_json = json::array();
 
-        // 计算缩放比例（原图 vs 缩小后的图）
-        float scale_x = 640.0f / frame.cols;
-        float scale_y = 480.0f / frame.rows;
+        // 计算缩放比例（原图 vs 实际编码图）
+        float scale_x = static_cast<float>(resized_frame.cols) / frame.cols;
+        float scale_y = static_cast<float>(resized_frame.rows) / frame.rows;
 
         for (const auto& det : dets) {
             json det_obj;
@@ -286,6 +348,13 @@ void inference_worker_thread(const std::string& input_source, const std::string&
 
         ++frame_id;
         g_total_frames++;
+
+        // 硬限流：每次循环总时长不低于 33ms
+        auto end_time = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        if (elapsed < 33) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(33 - elapsed));
+        }
     }
 
     g_inference_running = false;
@@ -364,9 +433,9 @@ int main(int argc, char** argv) {
             background: white;
             border-radius: 16px;
             box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
-            max-width: 960px;
+            max-width: 1360px;
             width: 100%;
-            max-height: 90vh;
+            height: 92vh;
             overflow: auto;
             display: flex;
             flex-direction: column;
@@ -383,7 +452,49 @@ int main(int argc, char** argv) {
         .content {
             padding: 24px;
             flex: 1;
+            overflow: hidden;
+            display: flex;
+            flex-direction: row;
+            gap: 16px;
+        }
+        .left-panel {
+            flex: 1;
+            min-width: 0;
             overflow-y: auto;
+            padding-right: 8px;
+        }
+        #history-panel {
+            width: 300px;
+            flex: 0 0 300px;
+            border-radius: 10px;
+            border: 1px solid #e7e7e7;
+            background: #fafafa;
+            padding: 12px;
+            overflow-y: auto;
+            box-shadow: inset 0 0 0 1px #ffffff;
+        }
+        #snapshot-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .snapshot-item {
+            border-radius: 8px;
+            overflow: hidden;
+            border: 1px solid #f0c2c2;
+            background: #fff;
+            box-shadow: 0 4px 10px rgba(255, 0, 0, 0.08);
+        }
+        .snapshot-item img {
+            width: 100%;
+            display: block;
+        }
+        .snapshot-item p {
+            margin: 0;
+            padding: 8px;
+            color: #b30000;
+            font-size: 12px;
+            font-weight: 600;
         }
         .video-section {
             margin-bottom: 20px;
@@ -526,6 +637,18 @@ int main(int argc, char** argv) {
             display: block;
         }
         @media (max-width: 768px) {
+            .content {
+                flex-direction: column;
+                overflow-y: auto;
+            }
+            .left-panel {
+                padding-right: 0;
+            }
+            #history-panel {
+                width: 100%;
+                flex: 0 0 auto;
+                max-height: 260px;
+            }
             .stats-grid {
                 grid-template-columns: 1fr;
             }
@@ -544,44 +667,51 @@ int main(int argc, char** argv) {
         <div class="header">🎬 YOLOv8 TensorRT 实时检测系统</div>
         
         <div class="content">
-            <div class="error-box" id="error-box"></div>
+            <div class="left-panel">
+                <div class="error-box" id="error-box"></div>
 
-            <div class="video-section">
-                <div class="video-container">
-                    <img id="video" src="" alt="Video Stream">
-                    <canvas id="overlay" style="display: none;"></canvas>
-                    <div id="loading" class="loading-spinner"></div>
+                <div class="video-section">
+                    <div class="video-container">
+                        <img id="video" src="" alt="Video Stream">
+                        <canvas id="overlay" style="display: none;"></canvas>
+                        <div id="loading" class="loading-spinner"></div>
+                    </div>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-label">
+                            <span class="status-badge" id="status-indicator"></span>连接状态
+                        </div>
+                        <div class="stat-value" id="status-text">离线</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">实时 FPS</div>
+                        <div class="stat-value" id="fps-value">-- fps</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">检测框数</div>
+                        <div class="stat-value" id="det-count">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">输入源</div>
+                        <div class="stat-value" id="source-info" style="font-size: 14px;">--</div>
+                    </div>
+                </div>
+
+                <div class="detections-section">
+                    <div class="detections-title">📊 实时检测结果</div>
+                    <div class="detections-grid" id="detections-grid">
+                        <div style="grid-column: 1/-1; text-align: center; color: #999; padding: 20px;">
+                            正在等待检测数据...
+                        </div>
+                    </div>
                 </div>
             </div>
 
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-label">
-                        <span class="status-badge" id="status-indicator"></span>连接状态
-                    </div>
-                    <div class="stat-value" id="status-text">离线</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">实时 FPS</div>
-                    <div class="stat-value" id="fps-value">-- fps</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">检测框数</div>
-                    <div class="stat-value" id="det-count">0</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">输入源</div>
-                    <div class="stat-value" id="source-info" style="font-size: 14px;">--</div>
-                </div>
-            </div>
-
-            <div class="detections-section">
-                <div class="detections-title">📊 实时检测结果</div>
-                <div class="detections-grid" id="detections-grid">
-                    <div style="grid-column: 1/-1; text-align: center; color: #999; padding: 20px;">
-                        正在等待检测数据...
-                    </div>
-                </div>
+            <div id="history-panel">
+                <div class="detections-title">📸 抓拍墙</div>
+                <div id="snapshot-list"></div>
             </div>
         </div>
     </div>
@@ -597,10 +727,14 @@ int main(int argc, char** argv) {
         const detCount = document.getElementById('det-count');
         const sourceInfo = document.getElementById('source-info');
         const detectionsGrid = document.getElementById('detections-grid');
+        const snapshotList = document.getElementById('snapshot-list');
         const errorBox = document.getElementById('error-box');
+        const canvas = overlay;
 
         const skeleton = [[15, 13], [13, 11], [16, 14], [14, 12], [11, 12], [5, 11], [6, 12], [5, 6], [5, 7], [6, 8], [7, 9], [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6]];
         let customZone = [];
+        let lastSnapshotTime = 0;
+        const SNAPSHOT_COOLDOWN = 3000;
 
         function isPointInPolygon(point, vs) {
             let inside = false;
@@ -647,6 +781,9 @@ int main(int argc, char** argv) {
             };
 )"
             R"(            eventSource.onmessage = (event) => {
+                // 【后台标签页检查】如果页面在后台，直接丢弃数据，避免积压
+                if (typeof document.hidden === 'boolean' && document.hidden) return;
+                
                 try {
                     const data = JSON.parse(event.data);
                     const dets = data.dets || data.detections || [];
@@ -698,6 +835,7 @@ int main(int argc, char** argv) {
                         const keypoints = Array.isArray(det.keypoints) ? det.keypoints : [];
 
                         let isIntruding = false;
+                        let isSos = false;
                         if (customZone.length >= 3) {
                             const leftAnkle = keypoints[15];
                             const rightAnkle = keypoints[16];
@@ -723,7 +861,28 @@ int main(int argc, char** argv) {
                             }
                         }
 
-                        if (isIntruding) {
+                        const nose = keypoints[0];
+                        const leftWrist = keypoints[9];
+                        const rightWrist = keypoints[10];
+                        if (nose && leftWrist && rightWrist
+                            && nose.conf > 0.4
+                            && leftWrist.conf > 0.4
+                            && rightWrist.conf > 0.4
+                            && leftWrist.y < nose.y
+                            && rightWrist.y < nose.y) {
+                            isSos = true;
+                        }
+
+                        if (isSos) {
+                            overlayCtx.strokeStyle = 'orange';
+                            overlayCtx.lineWidth = 3;
+                            overlayCtx.setLineDash([]);
+                            overlayCtx.strokeRect(x, y, w, h);
+
+                            overlayCtx.fillStyle = 'orange';
+                            overlayCtx.font = 'bold 28px Segoe UI';
+                            overlayCtx.fillText('🆘 紧急求救！', x, Math.max(28, y - 10));
+                        } else if (isIntruding) {
                             overlayCtx.strokeStyle = 'rgba(255, 0, 0, 1)';
                             overlayCtx.lineWidth = 3;
                             overlayCtx.setLineDash([]);
@@ -737,6 +896,36 @@ int main(int argc, char** argv) {
                             overlayCtx.lineWidth = 2;
                             overlayCtx.setLineDash([8, 6]);
                             overlayCtx.strokeRect(x, y, w, h);
+                        }
+
+                        const now = Date.now();
+                        if ((isIntruding || isSos) && (now - lastSnapshotTime > SNAPSHOT_COOLDOWN)) {
+                            lastSnapshotTime = now;
+                            // 【局部变量化】每次快照都创建新的 Image 对象，防止异步覆盖
+                            const tempImg = new Image();
+                            // 【先定义 onload】在赋值 src 前先设置加载完成回调
+                            tempImg.onload = function() {
+                                const snapCanvas = document.createElement('canvas');
+                                snapCanvas.width = tempImg.width;
+                                snapCanvas.height = tempImg.height;
+                                const snapCtx = snapCanvas.getContext('2d');
+                                // 1. 画视频底图
+                                snapCtx.drawImage(tempImg, 0, 0);
+                                // 2. 覆盖透明画板（拉伸到与底图同尺寸）
+                                snapCtx.drawImage(canvas, 0, 0, tempImg.width, tempImg.height);
+
+                                const finalDataUrl = snapCanvas.toDataURL('image/jpeg', 0.8);
+                                fetch('/api/save_snapshot', { method: 'POST', body: finalDataUrl });
+
+                                // 插入照片墙
+                                const eventText = isSos ? '🆘 紧急求救' : '⚠️ 违规闯入';
+                                const timeStr = new Date().toLocaleTimeString();
+                                const card = document.createElement('div');
+                                card.className = 'snapshot-item';
+                                card.innerHTML = `<img src="${finalDataUrl}" style="width:100%;"><p>${eventText} - ${timeStr}</p>`;
+                                document.getElementById('snapshot-list').prepend(card);
+                            };
+                            tempImg.src = 'data:image/jpeg;base64,' + data.image;
                         }
 
                         overlayCtx.strokeStyle = '#ff00ff';
@@ -873,6 +1062,49 @@ int main(int argc, char** argv) {
         });
     });
 
+    svr.Post("/api/save_snapshot", [](const httplib::Request& req, httplib::Response& res) {
+        if (req.body.empty()) {
+            res.status = 400;
+            res.set_content("empty request body", "text/plain; charset=utf-8");
+            return;
+        }
+
+        std::string payload = req.body;
+        const std::string prefix = "data:image/jpeg;base64,";
+        if (payload.rfind(prefix, 0) == 0) {
+            payload = payload.substr(prefix.size());
+        }
+
+        const std::string binary = base64_decode(payload);
+        if (binary.empty()) {
+            res.status = 400;
+            res.set_content("base64 decode failed", "text/plain; charset=utf-8");
+            return;
+        }
+
+        _mkdir("snapshots");
+        const auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const std::string filename = "snapshots/alert_" + std::to_string(ts_ms) + ".jpg";
+
+        std::ofstream ofs(filename, std::ios::binary);
+        if (!ofs) {
+            res.status = 500;
+            res.set_content("failed to open output file", "text/plain; charset=utf-8");
+            return;
+        }
+        ofs.write(binary.data(), static_cast<std::streamsize>(binary.size()));
+        ofs.close();
+
+        if (!ofs.good()) {
+            res.status = 500;
+            res.set_content("failed to write snapshot", "text/plain; charset=utf-8");
+            return;
+        }
+
+        res.set_content("saved: " + filename, "text/plain; charset=utf-8");
+    });
+
     // ========================================================================
     // 启动 HTTP 服务器
     // ========================================================================
@@ -886,7 +1118,7 @@ int main(int argc, char** argv) {
     if (!svr.listen("0.0.0.0", 8080)) {
         std::cerr << "[WebServer ERROR] 服务器启动失败！" << std::endl;
         g_inference_running = false;
-        cam_cv.notify_all();
+        frame_cv.notify_all();
         g_frame_cv.notify_all();
         camera_thread.join();
         inference_thread.join();
@@ -898,7 +1130,7 @@ int main(int argc, char** argv) {
     // ========================================================================
     std::cout << "\n[Main] HTTP 服务器已停止。" << std::endl;
     g_inference_running = false;
-    cam_cv.notify_all();
+    frame_cv.notify_all();
     g_frame_cv.notify_all();
 
     std::cout << "[Main] 等待拉流线程退出..." << std::endl;
