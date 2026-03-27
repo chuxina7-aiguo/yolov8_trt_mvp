@@ -110,3 +110,61 @@
 # 🚀 **v2.0 架构升级**
 
 彻底移除本地 GUI，采用 C++ 多线程 + httplib 构建后端，通过 SSE 协议向浏览器零延迟推送 Base64 视频流与 JSON 检测数据！
+
+
+
+
+
+
+
+
+
+# 🚀 YOLOv8-Pose TensorRT SaaS 级实时监控平台 (V1.0)
+
+本项目是一个基于 C++ TensorRT 高性能后端与 Web 前端交互的工业级 AI 视频分析原型系统。它不仅能实现极速的姿态识别，更赋予了 AI “理解空间”与“理解动作”的能力。
+
+---
+
+## 🌟 核心特性
+
+- **⚡ 极致性能**：基于 TensorRT 8.x 硬件加速，在 RTX 4060 上实现多线程解耦的生产者-消费者模型，推理侧几乎零延迟。
+- **📐 动态 ROI 电子围栏**：支持在 Web 界面使用鼠标实时绘制任意形状的多边形防区（射线法判定）。
+- **🆘 行为分析 (SOS)**：基于 17 个骨架关键点的几何拓扑关系，实时检测“举手求救”等异常行为。
+- **📸 异步抓拍系统**：发生违规或求救时，系统自动执行“视频流 + 算法层”图层合成，异步截取包含现场证据的高清 JPG 图片并持久化至本地磁盘。
+- **🌐 全栈架构**：
+  - **后端**：C++ 17, OpenCV, TensorRT, cpp-httplib (SSE 流式推送)。
+  - **前端**：Canvas API, JavaScript 异步驱动, 响应式安防看板布局。
+
+---
+
+## 🏗️ 系统架构图
+
+
+
+- **采集层 (CameraThread)**：负责 OpenCV 视频流解复用。
+- **推理层 (InferenceThread)**：TensorRT 执行 Pose 估计，并进行业务逻辑判定。
+- **分发层 (WebServer)**：通过 SSE (Server-Sent Events) 向前端毫秒级推送图像与 JSON 数据。
+- **展示层 (Frontend)**：Canvas 实时渲染骨架、报警框，管理证据墙。
+
+---
+
+## 🛠️ 快速开始
+
+### 1. 环境依赖
+- Windows 10/11, Visual Studio 2022
+- NVIDIA GPU (RTX 系列推荐) & CUDA 11.x/12.x
+- TensorRT 8.x
+- OpenCV 4.x
+
+### 2. 编译
+```powershell
+mkdir build
+cd build
+cmake ..
+cmake --build . --config Release
+```
+
+
+
+# 使用手机 IP 摄像头或 RTSP 流
+.\Release\yolov8_trt_mvp.exe "rtsp://admin:密码@IP:8554/live" models/yolov8n-pose.engine
