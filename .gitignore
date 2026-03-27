@@ -1,0 +1,25 @@
+# 编译生成的文件夹
+build/
+out/
+bin/
+
+# IDE 缓存文件
+.vs/
+*.user
+.vscode/
+
+# AI 模型文件 (永远不要把模型传到 Git 上！)
+*.pt
+*.onnx
+*.engine
+*.trt
+
+# 媒体数据文件
+*.mp4
+*.avi
+*.jpg
+*.png
+data/*
+models/*
+!data/.gitkeep
+!models/.gitkeep
