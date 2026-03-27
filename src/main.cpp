@@ -333,7 +333,8 @@ int main(int argc, char** argv) {
     // 【路由 1】GET / - 返回完整的 HTML5 SPA
     // ========================================================================
     svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
-        std::string html = R"(
+        const std::string html =
+            R"(
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -584,8 +585,8 @@ int main(int argc, char** argv) {
             </div>
         </div>
     </div>
-
-    <script>
+)"
+            R"(<script>
         const videoImg = document.getElementById('video');
         const overlay = document.getElementById('overlay');
         const overlayCtx = overlay.getContext('2d');
@@ -598,11 +599,40 @@ int main(int argc, char** argv) {
         const detectionsGrid = document.getElementById('detections-grid');
         const errorBox = document.getElementById('error-box');
 
+        const skeleton = [[15, 13], [13, 11], [16, 14], [14, 12], [11, 12], [5, 11], [6, 12], [5, 6], [5, 7], [6, 8], [7, 9], [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6]];
+        let customZone = [];
+
+        function isPointInPolygon(point, vs) {
+            let inside = false;
+            for (let i = 0, j = vs.length - 1; i < vs.length; j = i++) {
+                const xi = vs[i].x;
+                const yi = vs[i].y;
+                const xj = vs[j].x;
+                const yj = vs[j].y;
+
+                const intersect = ((yi > point.y) !== (yj > point.y))
+                    && (point.x < (xj - xi) * (point.y - yi) / ((yj - yi) || 1e-9) + xi);
+                if (intersect) inside = !inside;
+            }
+            return inside;
+        }
+
         function showError(msg) {
             errorBox.textContent = msg;
             errorBox.classList.add('show');
             setTimeout(() => errorBox.classList.remove('show'), 5000);
         }
+
+        overlay.addEventListener('click', (e) => {
+            const x = Math.round(e.offsetX);
+            const y = Math.round(e.offsetY);
+            customZone.push({ x, y });
+        });
+
+        overlay.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            customZone = [];
+        });
 
         function connectStream() {
             console.log('[WebClient] 连接 SSE 流...');
@@ -615,51 +645,103 @@ int main(int argc, char** argv) {
                 statusText.textContent = '在线';
                 errorBox.classList.remove('show');
             };
-
-            eventSource.onmessage = (event) => {
+)"
+            R"(            eventSource.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
                     const dets = data.dets || data.detections || [];
-                    const skeleton = [[15, 13], [13, 11], [16, 14], [14, 12], [11, 12], [5, 11], [6, 12], [5, 6], [5, 7], [6, 8], [7, 9], [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6]];
 
-                    // 更新视频画面
                     videoImg.src = 'data:image/jpeg;base64,' + data.image;
 
-                    // 同步 canvas 尺寸并清空上一帧，避免框叠加
                     const displayWidth = Math.max(1, Math.round(videoImg.clientWidth || 640));
                     const displayHeight = Math.max(1, Math.round(videoImg.clientHeight || 480));
                     if (overlay.width !== displayWidth || overlay.height !== displayHeight) {
                         overlay.width = displayWidth;
                         overlay.height = displayHeight;
                     }
+
                     overlay.style.display = 'block';
                     overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
 
-                    // 将后端 640x480 坐标缩放到当前画布尺寸
                     const scaleX = overlay.width / 640.0;
                     const scaleY = overlay.height / 480.0;
+
+                    if (customZone.length > 0) {
+                        overlayCtx.beginPath();
+                        overlayCtx.moveTo(customZone[0].x, customZone[0].y);
+                        for (let i = 1; i < customZone.length; i++) {
+                            overlayCtx.lineTo(customZone[i].x, customZone[i].y);
+                        }
+                        if (customZone.length >= 3) {
+                            overlayCtx.closePath();
+                            overlayCtx.fillStyle = 'rgba(255, 0, 0, 0.3)';
+                            overlayCtx.fill();
+                        }
+                        overlayCtx.strokeStyle = 'red';
+                        overlayCtx.lineWidth = 2;
+                        overlayCtx.setLineDash([]);
+                        overlayCtx.stroke();
+
+                        overlayCtx.fillStyle = 'red';
+                        customZone.forEach((p) => {
+                            overlayCtx.beginPath();
+                            overlayCtx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+                            overlayCtx.fill();
+                        });
+                    }
 
                     dets.forEach(det => {
                         const x = Math.round(det.x * scaleX);
                         const y = Math.round(det.y * scaleY);
                         const w = Math.round(det.width * scaleX);
                         const h = Math.round(det.height * scaleY);
-
-                        // 半透明红/绿框
-                        const isHelmet = (det.class_name === 'helmet' || det.class_id === 0);
-                        const boxColor = isHelmet ? 'rgba(57, 255, 20, 0.75)' : 'rgba(255, 0, 80, 0.75)';
-                        const boxFill = isHelmet ? 'rgba(57, 255, 20, 0.08)' : 'rgba(255, 0, 80, 0.08)';
-                        overlayCtx.lineWidth = 2;
-                        overlayCtx.strokeStyle = boxColor;
-                        overlayCtx.fillStyle = boxFill;
-                        overlayCtx.fillRect(x, y, w, h);
-                        overlayCtx.strokeRect(x, y, w, h);
-
                         const keypoints = Array.isArray(det.keypoints) ? det.keypoints : [];
 
-                        // 先画荧光粉骨架连线
+                        let isIntruding = false;
+                        if (customZone.length >= 3) {
+                            const leftAnkle = keypoints[15];
+                            const rightAnkle = keypoints[16];
+
+                            if (leftAnkle && leftAnkle.conf > 0) {
+                                const leftPt = {
+                                    x: Math.round(leftAnkle.x * scaleX),
+                                    y: Math.round(leftAnkle.y * scaleY)
+                                };
+                                if (isPointInPolygon(leftPt, customZone)) {
+                                    isIntruding = true;
+                                }
+                            }
+
+                            if (!isIntruding && rightAnkle && rightAnkle.conf > 0) {
+                                const rightPt = {
+                                    x: Math.round(rightAnkle.x * scaleX),
+                                    y: Math.round(rightAnkle.y * scaleY)
+                                };
+                                if (isPointInPolygon(rightPt, customZone)) {
+                                    isIntruding = true;
+                                }
+                            }
+                        }
+
+                        if (isIntruding) {
+                            overlayCtx.strokeStyle = 'rgba(255, 0, 0, 1)';
+                            overlayCtx.lineWidth = 3;
+                            overlayCtx.setLineDash([]);
+                            overlayCtx.strokeRect(x, y, w, h);
+
+                            overlayCtx.fillStyle = 'rgba(255, 0, 0, 1)';
+                            overlayCtx.font = 'bold 28px Segoe UI';
+                            overlayCtx.fillText('⚠️ 危险区闯入！', x, Math.max(28, y - 10));
+                        } else {
+                            overlayCtx.strokeStyle = 'rgba(57, 255, 20, 1)';
+                            overlayCtx.lineWidth = 2;
+                            overlayCtx.setLineDash([8, 6]);
+                            overlayCtx.strokeRect(x, y, w, h);
+                        }
+
                         overlayCtx.strokeStyle = '#ff00ff';
                         overlayCtx.lineWidth = 2;
+                        overlayCtx.setLineDash([]);
                         skeleton.forEach(([a, b]) => {
                             const p1 = keypoints[a];
                             const p2 = keypoints[b];
@@ -676,7 +758,6 @@ int main(int argc, char** argv) {
                             overlayCtx.stroke();
                         });
 
-                        // 再画荧光绿关键点
                         overlayCtx.fillStyle = '#39ff14';
                         keypoints.forEach((kp) => {
                             if (!kp) return;
@@ -691,12 +772,10 @@ int main(int argc, char** argv) {
                         });
                     });
 
-                    // 更新性能指标
                     fpsValue.textContent = data.fps.toFixed(1) + ' fps';
                     detCount.textContent = dets.length;
                     sourceInfo.textContent = data.source_info || '--';
 
-                    // 更新检测结果卡片
                     if (dets.length > 0) {
                         detectionsGrid.innerHTML = dets
                             .map(det => `
@@ -720,8 +799,8 @@ int main(int argc, char** argv) {
                     showError('数据解析失败: ' + e.message);
                 }
             };
-
-            eventSource.onerror = () => {
+)"
+            R"(            eventSource.onerror = () => {
                 console.error('[WebClient] SSE 连接错误');
                 statusIndicator.classList.remove('online');
                 statusText.textContent = '离线';
@@ -734,7 +813,6 @@ int main(int argc, char** argv) {
             window.addEventListener('beforeunload', () => eventSource.close());
         }
 
-        // 页面加载完毕后连接流
         window.addEventListener('load', connectStream);
     </script>
 </body>
