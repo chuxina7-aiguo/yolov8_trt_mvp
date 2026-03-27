@@ -277,13 +277,19 @@ void YoloV8TRT::postprocess(
     std::vector<Detection> candidates;
     candidates.reserve(static_cast<size_t>(output_num_boxes_));
 
-    struct TopScoreItem {
-        int idx = -1;
-        int cls = -1;
-        float score = 0.0f;
-    };
-    std::vector<TopScoreItem> top_scores;
-    top_scores.reserve(5);
+    // yolov8n-pose 输出定义（已由 Netron 确认）：[1,56,8400]
+    // [0:4] -> bbox(cx,cy,w,h), [4] -> objectness score,
+    // [5:56] -> 17 * (x,y,conf) 关键点。
+    constexpr int kObjScoreIndex = 4;
+    constexpr int kKptStartIndex = 5;
+    constexpr int kKptDim = 3;
+    constexpr int kNumKeypoints = 17;
+
+    if (output_num_attrs_ < kObjScoreIndex + 1) {
+        std::cerr << "输出属性数量不足，无法解析 pose 输出。attrs=" << output_num_attrs_ << std::endl;
+        detections.clear();
+        return;
+    }
 
     const bool is_box_major = false;
 
@@ -291,30 +297,23 @@ void YoloV8TRT::postprocess(
 
     auto read_value = [&](int attr, int box_idx) -> float {
         if (is_box_major) {
-            // [8400,84]：每个 box 连续存 84 个属性。
+            // [8400,56]：每个 box 连续存 56 个属性。
             return data[box_idx * output_num_attrs_ + attr];
         }
-        // [84,8400]：每个属性连续存 8400 个 box。
+        // [56,8400]：每个属性连续存 8400 个 box。
         return data[attr * output_num_boxes_ + box_idx];
     };
-
-    int global_best_idx = -1;
-    int global_best_cls = -1;
-    float global_best_score = -1.0f;
-    float global_best_cx = 0.0f;
-    float global_best_cy = 0.0f;
-    float global_best_w = 0.0f;
-    float global_best_h = 0.0f;
-    float global_best_x1 = 0.0f;
-    float global_best_y1 = 0.0f;
-    float global_best_x2 = 0.0f;
-    float global_best_y2 = 0.0f;
 
     for (int i = 0; i < output_num_boxes_; ++i) {
         const float cx_n = read_value(0, i);
         const float cy_n = read_value(1, i);
         const float w_n = read_value(2, i);
         const float h_n = read_value(3, i);
+        const float obj_score = read_value(kObjScoreIndex, i);
+
+        if (obj_score < conf_thres_) {
+            continue;
+        }
 
         // 安全帽模型直接输出像素坐标 (0~640)，无需缩放。
         const float cx = cx_n;
@@ -322,63 +321,38 @@ void YoloV8TRT::postprocess(
         const float w = w_n;
         const float h = h_n;
 
-        int best_cls = -1;
-        float best_score = 0.0f;
-
-        for (int c = 4; c < output_num_attrs_; ++c) {
-            const float score = read_value(c, i);
-            if (score > best_score) {
-                best_score = score;
-                best_cls = c - 4;
-            }
-        }
-
-        // 调试：在前几帧の前几个 box 中输出类别分数的原始值
-        static int debug_count = 0;
-        if (i < 3 && debug_count < 2) {
-            std::printf("[debug frame#%d] box_id=%d: ", debug_count, i);
-            for (int c = 4; c < output_num_attrs_; ++c) {
-                std::printf("class[%d]=%.8f ", c - 4, read_value(c, i));
-            }
-            std::printf("-> best_cls=%d best_score=%.8f\n", best_cls, best_score);
-            if (i == 2) debug_count++;
-        }
-
         float raw_x1 = (cx - 0.5f * w - info.pad_x) / info.scale;
         float raw_y1 = (cy - 0.5f * h - info.pad_y) / info.scale;
         float raw_x2 = (cx + 0.5f * w - info.pad_x) / info.scale;
         float raw_y2 = (cy + 0.5f * h - info.pad_y) / info.scale;
 
-        if (best_score > global_best_score && best_cls >= 0) {
-            global_best_score = best_score;
-            global_best_idx = i;
-            global_best_cls = best_cls;
-            global_best_cx = cx;
-            global_best_cy = cy;
-            global_best_w = w;
-            global_best_h = h;
-            global_best_x1 = raw_x1;
-            global_best_y1 = raw_y1;
-            global_best_x2 = raw_x2;
-            global_best_y2 = raw_y2;
-        }
+        Detection det;
+        det.class_id = 0;   // pose 输出无多类别分支，统一单类
+        det.score = obj_score;
+        det.kpts.reserve(kNumKeypoints);
 
-        // 调试：记录所有候选中置信度最高的前 5 个（不受阈值过滤）。
-        if (best_cls >= 0) {
-            if (top_scores.size() < 5) {
-                top_scores.push_back({i, best_cls, best_score});
-            } else {
-                auto min_it = std::min_element(top_scores.begin(), top_scores.end(), [](const TopScoreItem& a, const TopScoreItem& b) {
-                    return a.score < b.score;
-                });
-                if (min_it != top_scores.end() && best_score > min_it->score) {
-                    *min_it = {i, best_cls, best_score};
-                }
+        // 解析关键点通道（17 * [x,y,conf]，步长为 3），并映射回原图坐标后写入 det.kpts。
+        for (int k = 0; k < kNumKeypoints; ++k) {
+            const int base = kKptStartIndex + k * kKptDim;
+            if (base + 2 >= output_num_attrs_) {
+                break;
             }
+
+            const float kx = read_value(base + 0, i);
+            const float ky = read_value(base + 1, i);
+            const float kc = read_value(base + 2, i);
+
+            float mapped_kx = (kx - info.pad_x) / info.scale;
+            float mapped_ky = (ky - info.pad_y) / info.scale;
+
+            mapped_kx = std::max(0.0f, std::min(mapped_kx, static_cast<float>(img_w - 1)));
+            mapped_ky = std::max(0.0f, std::min(mapped_ky, static_cast<float>(img_h - 1)));
+
+            det.kpts.push_back({mapped_kx, mapped_ky, kc});
         }
 
-        if (best_score < conf_thres_ || best_cls < 0) {
-            continue;
+        while (det.kpts.size() < static_cast<size_t>(kNumKeypoints)) {
+            det.kpts.push_back({0.0f, 0.0f, 0.0f});
         }
 
         // 从 letterbox 坐标系映射回原图坐标系。
@@ -401,43 +375,8 @@ void YoloV8TRT::postprocess(
             continue;
         }
 
-        Detection det;
         det.box = cv::Rect(left, top, right - left, bottom - top);
-        det.class_id = best_cls;
-        det.score = best_score;
         candidates.push_back(det);
-    }
-
-    std::sort(top_scores.begin(), top_scores.end(), [](const TopScoreItem& a, const TopScoreItem& b) {
-        return a.score > b.score;
-    });
-    for (size_t k = 0; k < top_scores.size(); ++k) {
-        std::printf("[postprocess top5] rank=%zu idx=%d cls=%d score=%.6f\n",
-                    k + 1,
-                    top_scores[k].idx,
-                    top_scores[k].cls,
-                    top_scores[k].score);
-    }
-
-    if (global_best_idx >= 0) {
-        std::printf("[postprocess best] layout=%s idx=%d cls=%d score=%.6f raw_input_px(cx,cy,w,h)=(%.3f,%.3f,%.3f,%.3f) mapped(x1,y1,x2,y2)=(%.3f,%.3f,%.3f,%.3f) scale=%.6f pad=(%.3f,%.3f) attrs=%d boxes=%d\n",
-                    is_box_major ? "box-major" : "attr-major",
-                    global_best_idx,
-                    global_best_cls,
-                    global_best_score,
-                    global_best_cx,
-                    global_best_cy,
-                    global_best_w,
-                    global_best_h,
-                    global_best_x1,
-                    global_best_y1,
-                    global_best_x2,
-                    global_best_y2,
-                    info.scale,
-                    info.pad_x,
-                    info.pad_y,
-                    output_num_attrs_,
-                    output_num_boxes_);
     }
 
     detections = nms(candidates, nms_thres_);

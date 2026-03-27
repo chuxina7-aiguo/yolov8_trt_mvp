@@ -9,10 +9,17 @@
 
 #include "preprocess_cuda.h"
 
+struct Keypoint {
+    float x = 0.0f;
+    float y = 0.0f;
+    float conf = 0.0f;
+};
+
 struct Detection {
     cv::Rect box;
     int class_id = -1;
     float score = 0.0f;
+    std::vector<Keypoint> kpts;
 };
 
 class YoloV8TRT {

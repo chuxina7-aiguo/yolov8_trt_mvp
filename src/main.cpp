@@ -32,6 +32,11 @@ FrameData g_latest_frame;               // 最新帧数据
 std::mutex g_frame_mtx;                 // 帧数据互斥锁
 std::condition_variable g_frame_cv;     // 帧数据条件变量
 
+cv::Mat global_frame;
+std::mutex cam_mtx;
+std::condition_variable cam_cv;
+bool fresh_frame = false;
+
 std::atomic<bool> g_inference_running(true);   // 推理线程运行标志
 std::atomic<int> g_total_frames(0);            // 总帧计数
 
@@ -68,45 +73,63 @@ std::string base64_encode(const std::vector<uchar>& data) {
 }
 
 // ============================================================================
+// 【拉流线程函数】Camera Producer Thread
+// ============================================================================
+
+void camera_thread_func(const std::string& url) {
+    std::cout << "[CameraThread] 启动拉流线程..." << std::endl;
+
+    cv::VideoCapture cap;
+    if (isNumericString(url)) {
+        int camera_index = std::stoi(url);
+        cap.open(camera_index);
+        if (cap.isOpened()) {
+            cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+            cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+            cap.set(cv::CAP_PROP_FPS, 30);
+        }
+    } else {
+        cap.open(url);
+    }
+
+    if (!cap.isOpened()) {
+        std::cerr << "[CameraThread ERROR] 无法打开视频源: " << url << std::endl;
+        g_inference_running = false;
+        cam_cv.notify_all();
+        return;
+    }
+
+    std::cout << "[CameraThread] ✓ 拉流已启动: " << url << std::endl;
+
+    cv::Mat tmp;
+    while (g_inference_running) {
+        if (!cap.read(tmp)) {
+            continue;
+        }
+        if (tmp.empty()) {
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(cam_mtx);
+            global_frame = tmp.clone();
+            fresh_frame = true;
+        }
+        cam_cv.notify_one();
+    }
+
+    cap.release();
+    std::cout << "[CameraThread] 拉流线程退出。" << std::endl;
+}
+
+// ============================================================================
 // 【推理子线程函数】Inference Worker Thread
 // ============================================================================
 
 void inference_worker_thread(const std::string& input_source, const std::string& engine_path) {
     std::cout << "\n[InferenceThread] 启动推理线程..." << std::endl;
 
-    // ========================================================================
-    // 打开输入源（摄像头或视频文件）
-    // ========================================================================
-    cv::VideoCapture cap;
-    bool is_camera = isNumericString(input_source);
-
-    if (is_camera) {
-        int camera_index = std::stoi(input_source);
-        cap.open(camera_index);
-        if (!cap.isOpened()) {
-            std::cerr << "[InferenceThread ERROR] 无法打开摄像头设备: " << camera_index << std::endl;
-            g_inference_running = false;
-            return;
-        }
-
-        cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-        cap.set(cv::CAP_PROP_FPS, 30);
-
-        std::cout << "[InferenceThread] ✓ 已打开摄像头设备: " << camera_index << std::endl;
-    } else {
-        cap.open(input_source);
-        if (!cap.isOpened()) {
-            std::cerr << "[InferenceThread ERROR] 无法打开视频文件: " << input_source << std::endl;
-            g_inference_running = false;
-            return;
-        }
-
-        int total_frames = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_COUNT));
-        double fps = cap.get(cv::CAP_PROP_FPS);
-        std::cout << "[InferenceThread] ✓ 已打开视频文件: " << input_source << std::endl;
-        std::cout << "[InferenceThread]   帧数: " << total_frames << " | 帧率: " << fps << " FPS" << std::endl;
-    }
+    const bool is_camera = isNumericString(input_source);
 
     // ========================================================================
     // 初始化 YoloV8TRT 检测器
@@ -114,8 +137,8 @@ void inference_worker_thread(const std::string& input_source, const std::string&
     YoloV8TRT detector(engine_path, 0.40f, 0.45f);  // 提高置信度阈值以过滤低分框
     if (!detector.isReady()) {
         std::cerr << "[InferenceThread ERROR] 检测器初始化失败！" << std::endl;
-        cap.release();
         g_inference_running = false;
+        cam_cv.notify_all();
         return;
     }
 
@@ -130,10 +153,19 @@ void inference_worker_thread(const std::string& input_source, const std::string&
     double avg_fps = 0.0;
     int fps_count = 0;
 
-    while (g_inference_running && cap.read(frame)) {
+    while (g_inference_running) {
+        {
+            std::unique_lock<std::mutex> lock(cam_mtx);
+            cam_cv.wait(lock, [] { return fresh_frame || !g_inference_running; });
+            if (!g_inference_running) {
+                break;
+            }
+            frame = global_frame.clone();
+            fresh_frame = false;
+        }
+
         if (frame.empty()) {
-            std::cout << "[InferenceThread] 视频流结束。" << std::endl;
-            break;
+            continue;
         }
 
         // 记录时间戳
@@ -216,6 +248,15 @@ void inference_worker_thread(const std::string& input_source, const std::string&
             det_obj["y"] = static_cast<int>(det.box.y * scale_y);
             det_obj["width"] = static_cast<int>(det.box.width * scale_x);
             det_obj["height"] = static_cast<int>(det.box.height * scale_y);
+            json keypoints_json = json::array();
+            for (const auto& kp : det.kpts) {
+                json kp_obj;
+                kp_obj["x"] = static_cast<int>(std::round(kp.x * scale_x));
+                kp_obj["y"] = static_cast<int>(std::round(kp.y * scale_y));
+                kp_obj["conf"] = kp.conf;
+                keypoints_json.push_back(kp_obj);
+            }
+            det_obj["keypoints"] = keypoints_json;
             
             detections_json.push_back(det_obj);
         }
@@ -247,7 +288,6 @@ void inference_worker_thread(const std::string& input_source, const std::string&
         g_total_frames++;
     }
 
-    cap.release();
     g_inference_running = false;
 
     // 输出最终统计
@@ -276,8 +316,9 @@ int main(int argc, char** argv) {
     std::cout << "╚══════════════════════════════════════════════════════════════╝\n" << std::endl;
 
     // ========================================================================
-    // 启动推理线程
+    // 启动拉流线程 + 推理线程
     // ========================================================================
+    std::thread camera_thread(camera_thread_func, input_source);
     std::thread inference_thread(inference_worker_thread, input_source, engine_path);
 
     // 等待推理线程初始化完成
@@ -579,6 +620,7 @@ int main(int argc, char** argv) {
                 try {
                     const data = JSON.parse(event.data);
                     const dets = data.dets || data.detections || [];
+                    const skeleton = [[15, 13], [13, 11], [16, 14], [14, 12], [11, 12], [5, 11], [6, 12], [5, 6], [5, 7], [6, 8], [7, 9], [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6]];
 
                     // 更新视频画面
                     videoImg.src = 'data:image/jpeg;base64,' + data.image;
@@ -596,29 +638,57 @@ int main(int argc, char** argv) {
                     // 将后端 640x480 坐标缩放到当前画布尺寸
                     const scaleX = overlay.width / 640.0;
                     const scaleY = overlay.height / 480.0;
+
                     dets.forEach(det => {
                         const x = Math.round(det.x * scaleX);
                         const y = Math.round(det.y * scaleY);
                         const w = Math.round(det.width * scaleX);
                         const h = Math.round(det.height * scaleY);
 
-                        let color = '#4dabf7';
-                        if (det.class_name === 'helmet' || det.class_id === 0) color = '#51cf66';
-                        else if (det.class_name === 'head' || det.class_id === 1) color = '#ff6b6b';
-
-                        overlayCtx.strokeStyle = color;
+                        // 半透明红/绿框
+                        const isHelmet = (det.class_name === 'helmet' || det.class_id === 0);
+                        const boxColor = isHelmet ? 'rgba(57, 255, 20, 0.75)' : 'rgba(255, 0, 80, 0.75)';
+                        const boxFill = isHelmet ? 'rgba(57, 255, 20, 0.08)' : 'rgba(255, 0, 80, 0.08)';
                         overlayCtx.lineWidth = 2;
+                        overlayCtx.strokeStyle = boxColor;
+                        overlayCtx.fillStyle = boxFill;
+                        overlayCtx.fillRect(x, y, w, h);
                         overlayCtx.strokeRect(x, y, w, h);
 
-                        const label = `${det.class_name || det.class_id} ${(det.score * 100).toFixed(1)}%`;
-                        overlayCtx.font = '14px Segoe UI';
-                        const textW = Math.ceil(overlayCtx.measureText(label).width);
-                        const textX = x;
-                        const textY = Math.max(16, y - 4);
-                        overlayCtx.fillStyle = color;
-                        overlayCtx.fillRect(textX, textY - 14, textW + 8, 16);
-                        overlayCtx.fillStyle = '#ffffff';
-                        overlayCtx.fillText(label, textX + 4, textY - 2);
+                        const keypoints = Array.isArray(det.keypoints) ? det.keypoints : [];
+
+                        // 先画荧光粉骨架连线
+                        overlayCtx.strokeStyle = '#ff00ff';
+                        overlayCtx.lineWidth = 2;
+                        skeleton.forEach(([a, b]) => {
+                            const p1 = keypoints[a];
+                            const p2 = keypoints[b];
+                            if (!p1 || !p2) return;
+                            if ((p1.x === 0 && p1.y === 0) || (p2.x === 0 && p2.y === 0)) return;
+
+                            const x1 = Math.round(p1.x * scaleX);
+                            const y1 = Math.round(p1.y * scaleY);
+                            const x2 = Math.round(p2.x * scaleX);
+                            const y2 = Math.round(p2.y * scaleY);
+                            overlayCtx.beginPath();
+                            overlayCtx.moveTo(x1, y1);
+                            overlayCtx.lineTo(x2, y2);
+                            overlayCtx.stroke();
+                        });
+
+                        // 再画荧光绿关键点
+                        overlayCtx.fillStyle = '#39ff14';
+                        keypoints.forEach((kp) => {
+                            if (!kp) return;
+                            if (typeof kp.conf === 'number' && kp.conf <= 0.4) return;
+                            if (kp.x === 0 && kp.y === 0) return;
+
+                            const kx = Math.round(kp.x * scaleX);
+                            const ky = Math.round(kp.y * scaleY);
+                            overlayCtx.beginPath();
+                            overlayCtx.arc(kx, ky, 3, 0, Math.PI * 2);
+                            overlayCtx.fill();
+                        });
                     });
 
                     // 更新性能指标
@@ -738,6 +808,9 @@ int main(int argc, char** argv) {
     if (!svr.listen("0.0.0.0", 8080)) {
         std::cerr << "[WebServer ERROR] 服务器启动失败！" << std::endl;
         g_inference_running = false;
+        cam_cv.notify_all();
+        g_frame_cv.notify_all();
+        camera_thread.join();
         inference_thread.join();
         return -1;
     }
@@ -747,8 +820,11 @@ int main(int argc, char** argv) {
     // ========================================================================
     std::cout << "\n[Main] HTTP 服务器已停止。" << std::endl;
     g_inference_running = false;
+    cam_cv.notify_all();
     g_frame_cv.notify_all();
 
+    std::cout << "[Main] 等待拉流线程退出..." << std::endl;
+    camera_thread.join();
     std::cout << "[Main] 等待推理线程退出..." << std::endl;
     inference_thread.join();
 
