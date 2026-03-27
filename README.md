@@ -102,3 +102,11 @@
   - A**: 
     1. **401 报错**说明 App 有密码保护。请在网址中加入账号密码，格式为：`rtsp://账号:密码@IP:端口/live`。
     2. **超时卡死**通常是因为 UDP 协议被局域网拦截。请在手机 App 设置中关闭“强制 TCP”，允许 UDP 传输；或者在 PowerShell 中运行 `$env:OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;tcp"` 强行改用 TCP 通道。
+
+
+
+
+
+# 🚀 **v2.0 架构升级**
+
+彻底移除本地 GUI，采用 C++ 多线程 + httplib 构建后端，通过 SSE 协议向浏览器零延迟推送 Base64 视频流与 JSON 检测数据！

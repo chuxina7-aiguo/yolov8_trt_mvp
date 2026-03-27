@@ -52,6 +52,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     ${OpenCV_LIBS}
     ${TENSORRT_NVINFER}
     CUDA::cudart
+    ws2_32
 )
 
 # 某些环境下需要显式启用可分离编译。
