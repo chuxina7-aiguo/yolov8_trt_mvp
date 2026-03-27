@@ -93,3 +93,12 @@
 ### 4. 视觉渲染与交付 (Rendering)
 * 最后，基于提纯后的坐标集合，使用 `cv::rectangle` 绘制红绿边框。
 * 调用 `std::chrono` 统计端到端耗时，换算为真实的 FPS，并通过 `cv::putText` 渲染至视频流的左上角，最终通过 `cv::imshow` 交付给用户。
+
+
+
+# 🚑 避坑指南 (Q&A)
+
+- **Q: 接入 RTSP 手机摄像头时，报错 `401 Unauthorized` 或者卡死超时怎么办？**
+  - A**: 
+    1. **401 报错**说明 App 有密码保护。请在网址中加入账号密码，格式为：`rtsp://账号:密码@IP:端口/live`。
+    2. **超时卡死**通常是因为 UDP 协议被局域网拦截。请在手机 App 设置中关闭“强制 TCP”，允许 UDP 传输；或者在 PowerShell 中运行 `$env:OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;tcp"` 强行改用 TCP 通道。
